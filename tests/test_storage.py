@@ -2,6 +2,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 import storage
 
 
@@ -51,3 +53,36 @@ def test_corrupt_primary_never_clobbers_good_bak(tmp_path):
     storage.atomic_write_json(p, {"v": 3})        # must NOT rotate junk into bak
     assert json.loads(_bak(p).read_text(encoding="utf-8")) == {"v": 1}
     assert storage.read_json(p) == {"v": 3}
+
+
+def test_write_retries_when_target_is_briefly_locked(tmp_path, monkeypatch):
+    p = tmp_path / "data.json"
+    p.write_text(json.dumps({"v": 0}), encoding="utf-8")   # valid primary to rotate
+    real_replace = storage.os.replace
+    swaps = {"n": 0}
+
+    def flaky_replace(src, dst):
+        if Path(dst) == p:                # only the tmp->primary swap is contended
+            swaps["n"] += 1
+            if swaps["n"] < 3:
+                raise PermissionError("locked by AV / Search Indexer")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(storage.os, "replace", flaky_replace)
+    monkeypatch.setattr(storage.time, "sleep", lambda *_: None)
+    storage.atomic_write_json(p, {"v": 1})
+    assert storage.read_json(p) == {"v": 1}
+    assert swaps["n"] == 3                 # failed twice, succeeded on the third
+
+
+def test_write_raises_and_cleans_up_after_exhausting_retries(tmp_path, monkeypatch):
+    p = tmp_path / "data.json"            # no prior primary -> no .bak rotation
+
+    def always_locked(src, dst):
+        raise PermissionError("permanently locked")
+
+    monkeypatch.setattr(storage.os, "replace", always_locked)
+    monkeypatch.setattr(storage.time, "sleep", lambda *_: None)
+    with pytest.raises(PermissionError):
+        storage.atomic_write_json(p, {"v": 1})
+    assert list(tmp_path.glob("*.tmp")) == []   # temp file removed in finally

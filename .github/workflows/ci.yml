@@ -37,5 +37,32 @@ jobs:
       - name: Type check (pyright)
         run: python -m pyright
 
-      - name: Run tests (pytest)
-        run: python -m pytest
+      - name: Run tests with coverage
+        # Coverage scope + omit live in pyproject.toml ([tool.coverage.run]).
+        # Build fails if coverage of the unit-testable surface drops below 95%.
+        run: >
+          python -m pytest
+          --cov=.
+          --cov-report=term-missing
+          --cov-report=xml
+          --cov-report=html
+          --cov-fail-under=95
+
+      - name: Coverage summary
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path .coverage) {
+            "## Coverage" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            python -m coverage report --format=markdown | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage.xml
+            htmlcov/
+          if-no-files-found: ignore

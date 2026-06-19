@@ -84,3 +84,32 @@ def test_legacy_flat_list_is_migrated_on_load(tmp_path, monkeypatch):
     assert m.get("Old").output_device_id == "o"
     assert m.get("Old").refresh_rate == 60
     assert m.get_active() is None   # bare-list legacy shape has no active marker
+
+
+def test_profile_factory_builds_caps_shaped_mode():
+    """The legacy flat Profile(...) factory must yield a caps-shaped Mode."""
+    m = profiles.Profile("Game", output_device_id="o1", comms_device_id="m1",
+                          output_volume=0.5, refresh_rate=144, hotkey="ctrl+1")
+    assert m.name == "Game"
+    assert m.hotkey == "ctrl+1"
+    assert m.caps["audio.output"] == {"device_id": "o1"}
+    assert m.caps["display.refresh"] == {"hz": 144}
+
+
+def _boom(*_a, **_k):
+    raise OSError("simulated disk error")
+
+
+def test_load_survives_read_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(profiles, "PROFILES_PATH", tmp_path / "profiles.json")
+    monkeypatch.setattr(profiles, "read_json", _boom)
+    m = profiles.ProfileManager()              # must not raise
+    assert m.get_profiles() == []
+
+
+def test_save_survives_write_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(profiles, "PROFILES_PATH", tmp_path / "profiles.json")
+    m = profiles.ProfileManager()
+    monkeypatch.setattr(profiles, "atomic_write_json", _boom)
+    m.add_or_update(make_audio_mode("A", output_device_id="o1"))   # error swallowed
+    assert m.get("A") is not None              # in-memory state intact

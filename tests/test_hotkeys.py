@@ -209,3 +209,38 @@ def test_dispatch_swallows_callback_exception():
     mgr.set_bindings([("ctrl+shift+a", boom)])
     hk_id = next(iter(win.live))
     assert mgr.dispatch(hk_id) is True   # raised, but reported handled
+
+
+def test_parse_skips_empty_tokens():
+    # a doubled '+' yields an empty token that must be skipped, not rejected
+    mods, vk = parse_combo("ctrl++a")
+    assert mods == MOD_CONTROL | MOD_NOREPEAT
+    assert vk == ord("A")
+
+
+def test_parse_rejects_unknown_single_char():
+    assert parse_combo("ctrl+!") is None   # single char that is neither alnum nor OEM key
+
+
+def test_set_bindings_skips_empty_combo():
+    win = FakeWin()
+    mgr = _mgr(win)
+    failed = mgr.set_bindings([("", lambda: None), ("ctrl+a", lambda: None)])
+    assert failed == []
+    assert mgr.has("ctrl+a")
+    assert not mgr.has("")
+    assert len(win.live) == 1
+
+
+def test_unregister_errors_are_swallowed():
+    """A failing UnregisterHotKey (e.g. Windows already reclaimed the id across a
+    suspend) must not abort the resume re-registration path."""
+    def ok_register(hk_id, mods, vk):
+        return True
+    def boom_unregister(hk_id):
+        raise RuntimeError("Win32 UnregisterHotKey failed")
+    mgr = HotkeyManager(register_fn=ok_register, unregister_fn=boom_unregister)
+    mgr.set_bindings([("ctrl+a", lambda: None)])
+    failed = mgr.reregister_all()         # drops live regs (raising) then re-adds
+    assert failed == []
+    assert mgr.has("ctrl+a")

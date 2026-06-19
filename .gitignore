@@ -24,5 +24,11 @@ _*.py
 # …but never ignore package __init__.py (the _*.py rule would otherwise eat it)
 !**/__init__.py
 
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
 # Logs
 *.log
