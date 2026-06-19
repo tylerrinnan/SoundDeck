@@ -8,7 +8,8 @@ Windows system-tray audio switcher + display utility. PyQt6 overlay, pycaw/comty
 ## Architecture
 
 ```
-main.py          Entry point: hotkey, single-instance mutex, manager wiring
+main.py          Entry point: hotkey wiring, single-instance mutex, resume hooks
+  ├─ hotkeys.py  Win32 RegisterHotKey wrapper: self-healing desired/live reconcile
   ├─ audio.py    Windows Core Audio (pycaw + raw COM vtable for SetDefaultEndpoint)
   ├─ mixer.py    Per-app audio sessions (volume/mute per PID)
   ├─ hdr.py      HDR state via DisplayConfigGetDeviceInfo; toggle via Win+Alt+B
@@ -35,9 +36,10 @@ main.py          Entry point: hotkey, single-instance mutex, manager wiring
 | `gsync.py` | Per-display G-Sync Compatible detect + toggle via NVAPI Adaptive Sync API | ctypes (nvapi64) |
 | `profiles.py` | Profile CRUD, active profile tracking | nothing |
 | `settings.py` | Key-value settings persistence | nothing |
+| `hotkeys.py` | Global hotkey parse + durable register/reconcile | ctypes (user32), log |
 | `overlay.py` | Main UI window, refresh loop, user interaction | all above + theme, widgets |
 | `tray.py` | System tray icon + menu | audio (for tooltip), pystray |
-| `main.py` | Wiring, hotkey registration, app lifecycle | all above |
+| `main.py` | Wiring, hotkey desired-set + retry/heal, app lifecycle | all above |
 
 ## Threading model
 - **UI thread**: All Qt widget operations. Never call COM/pycaw here.
@@ -81,6 +83,13 @@ main.py          Entry point: hotkey, single-instance mutex, manager wiring
   - `NvAPI_DISP_GetAdaptiveSyncData` (0xB73D1EE9) returning `NVAPI_OK` is the capability bit. **GET struct stamp**: drivers want `size=40, version=1` (`0x00010028`), NOT the 24-byte V1 in public NVAPI headers — there are undocumented trailing fields.
   - `is_capable(name)` is one-way sticky: once a display reports capable, never revoke. Some drivers fail this Get when `VRR_MODE=0`, which would otherwise make the global pill vanish after toggling off.
 - All NVAPI calls run inside `_com_thread()` — never on the Qt UI thread.
+
+## Hotkeys (hotkeys.py + main.py)
+- Global hotkeys use kernel-managed `RegisterHotKey` (WM_HOTKEY), pumped via `main._NativeFilter` (a `QAbstractNativeEventFilter`). Register from the Qt UI thread so messages post to the queue that filter pumps. `parse_combo` mirrors `widgets._KEY_MAP`; every combo gets `MOD_NOREPEAT`.
+- **Durability model — desired vs live.** `HotkeyManager` keeps two maps: `_desired` (combo→binding, the durable INTENT for the main hotkey + every profile hotkey) and `_live` (id→binding, what is actually registered with Windows). `set_bindings(...)` replaces the desired set and reconciles; `reconcile()` registers any desired combo not currently live and **returns the combos that still failed**; `reregister_all()` (resume path) drops live regs and re-asserts the *desired* set — never the live cache.
+- **Why this design:** the old code conflated intent with the live cache, so a single transient `RegisterHotKey` failure (combo briefly owned by the shell/another app right after boot or resume) dropped the binding permanently until the app restarted. The decoupled desired set + retry makes it self-heal. Data persistence was never the bug — profile hotkeys serialize fine in `profiles.json` (`Mode.hotkey`); the failure was registration-only.
+- **Self-heal in main.py:** `_register_all_hotkeys()` re-derives the desired set from `settings.get("hotkey")` + each profile's `hotkey`, calls `set_bindings`, and on any failure schedules a `_retry_timer` backoff (`_RETRY_DELAYS_MS`) that calls `reconcile()`. A `_heal_timer` reconciles every `_HEAL_INTERVAL_MS` (45 s) to recover a hotkey later stolen by another app. Resume/unlock (`_on_system_resume`) re-runs `_register_all_hotkeys()` (not a bare cache replay).
+- `HotkeyManager(register_fn, unregister_fn)` injects the Win32 calls so the reconcile logic is unit-tested with a fake in `tests/test_hotkeys.py`. Logging goes through `log.py` (a frozen `--windowed` exe has no stdout, so the old `print` diagnostics were invisible).
 
 ## Build & run
 ```

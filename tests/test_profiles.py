@@ -28,6 +28,28 @@ def test_persistence_round_trip(tmp_path, monkeypatch):
     assert reloaded.get("A").refresh_rate == 144
 
 
+def test_hotkey_survives_save_load(tmp_path, monkeypatch):
+    """A profile's bound hotkey must persist across a process restart — this is
+    what the global-hotkey re-registration reads back on next launch."""
+    m = _mgr(tmp_path, monkeypatch)
+    m.add_or_update(make_audio_mode("solo", output_device_id="o1", hotkey="ctrl+shift+1"))
+    m.add_or_update(make_audio_mode("friends", output_device_id="o2", hotkey="ctrl+shift+2"))
+    reloaded = profiles.ProfileManager()
+    assert reloaded.get("solo").hotkey == "ctrl+shift+1"
+    assert reloaded.get("friends").hotkey == "ctrl+shift+2"
+
+
+def test_hotkey_preserved_when_only_audio_caps_updated(tmp_path, monkeypatch):
+    """Editing a profile's audio selection in place must not drop its hotkey
+    (overlay._update_active_profile mutates audio caps but leaves hotkey)."""
+    m = _mgr(tmp_path, monkeypatch)
+    m.add_or_update(make_audio_mode("solo", output_device_id="o1", hotkey="ctrl+shift+1"))
+    prof = m.get("solo")
+    prof.output_device_id = "o2"        # simulate a device re-selection
+    m.add_or_update(prof)
+    assert profiles.ProfileManager().get("solo").hotkey == "ctrl+shift+1"
+
+
 def test_rename(tmp_path, monkeypatch):
     m = _mgr(tmp_path, monkeypatch)
     m.add_or_update(make_audio_mode("A"))

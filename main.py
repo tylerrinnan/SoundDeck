@@ -6,6 +6,7 @@ import sys
 import os
 import ctypes
 from ctypes import wintypes
+from typing import Callable, List, Tuple
 
 os.environ.setdefault("PYSTRAY_BACKEND", "win32")
 
@@ -23,6 +24,7 @@ from overlay  import OverlayWindow
 from tray     import TrayManager
 from caps     import build_default_registry
 from hotkeys  import HotkeyManager, WM_HOTKEY
+from log      import log
 
 MUTEX_NAME = "SoundDeck_SingleInstance_Mutex"
 
@@ -104,16 +106,48 @@ def main() -> None:
 
     hotkeys = HotkeyManager()
 
-    def _register_all_hotkeys() -> None:
-        hotkeys.unregister_all()
-        main_combo = settings.get("hotkey")
-        if not hotkeys.register(main_combo, _emit):
-            print(f"[main] main hotkey {main_combo!r} could not be registered")
+    # Hotkey registration is self-healing. set_bindings/reconcile re-assert the
+    # desired set (main hotkey + every profile hotkey) against Windows; any combo
+    # that transiently fails to register — e.g. briefly owned by the shell or
+    # another auto-started app right after boot/resume — is retried with backoff
+    # and re-checked periodically. A single best-effort RegisterHotKey would
+    # instead lose that hotkey until the app restarts, which is the original bug.
+    _RETRY_DELAYS_MS  = (400, 1000, 2500, 5000, 10000)
+    _HEAL_INTERVAL_MS = 45000
+
+    _retry_timer = QTimer()
+    _retry_timer.setSingleShot(True)
+    _heal_timer = QTimer()
+    _heal_timer.setInterval(_HEAL_INTERVAL_MS)
+    _retry_attempts = {"n": 0}
+
+    def _desired_bindings() -> List[Tuple[str, Callable[[], None]]]:
+        # Source of truth, re-derived on every call so settings/profile edits and
+        # resume all converge on the same set.
+        bindings: List[Tuple[str, Callable[[], None]]] = [(settings.get("hotkey"), _emit)]
         for profile in profiles.get_profiles():
-            if not profile.hotkey:
-                continue
-            name = profile.name
-            hotkeys.register(profile.hotkey, lambda n=name: _emit_profile(n))
+            if profile.hotkey:
+                name = profile.name
+                bindings.append((profile.hotkey, lambda n=name: _emit_profile(n)))
+        return bindings
+
+    def _schedule_retry() -> None:
+        n = _retry_attempts["n"]
+        if n < len(_RETRY_DELAYS_MS):
+            _retry_timer.start(_RETRY_DELAYS_MS[n])
+
+    def _on_retry() -> None:
+        _retry_attempts["n"] += 1
+        if hotkeys.reconcile():        # still-failing combos → keep backing off
+            _schedule_retry()
+
+    def _register_all_hotkeys() -> None:
+        _retry_attempts["n"] = 0
+        if hotkeys.set_bindings(_desired_bindings()):
+            _schedule_retry()
+
+    _retry_timer.timeout.connect(_on_retry)
+    _heal_timer.timeout.connect(hotkeys.reconcile)
 
     def rebind_hotkey(new_combo: str) -> None:
         old = settings.get("hotkey")
@@ -129,7 +163,7 @@ def main() -> None:
                 f'Could not register hotkey "{new_combo}".\nReverted to {old}.',
             )
             return
-        print(f"[main] Hotkey rebound to {new_combo.upper()}")
+        log(f"[main] Hotkey rebound to {new_combo.upper()}")
 
     overlay = OverlayWindow(
         audio           = audio,
@@ -160,9 +194,12 @@ def main() -> None:
     bridge.apply_profile.connect(overlay.apply_profile_by_hotkey)
 
     def _on_system_resume() -> None:
-        # RegisterHotKey survives sleep, but we belt-and-suspenders refresh
-        # ownership tables in case the shell process briefly stomped them.
-        QTimer.singleShot(0, hotkeys.reregister_all)
+        # RegisterHotKey survives sleep, but we belt-and-suspenders re-derive the
+        # desired set from settings+profiles and reconcile it, in case the shell
+        # process briefly stomped ownership. Re-deriving (not replaying the live
+        # cache) plus the backoff retry means a combo lost to a transient
+        # post-resume conflict still recovers instead of staying dead.
+        QTimer.singleShot(0, _register_all_hotkeys)
         # COM proxies for endpoint volume/peak meter become dead pointers
         # after suspend, producing "Element not found" spam until evicted.
         try:
@@ -175,7 +212,7 @@ def main() -> None:
             QTimer.singleShot(0, overlay.invalidate_state)
         except Exception:
             pass
-        print("[main] System resume/unlock — caches invalidated, hotkeys re-registered")
+        log("[main] System resume/unlock — caches invalidated, hotkeys re-registered")
 
     native_filter = _NativeFilter(hotkeys, _on_system_resume)
     app.installNativeEventFilter(native_filter)
@@ -188,9 +225,10 @@ def main() -> None:
         wts.WTSRegisterSessionNotification(
             wintypes.HWND(int(overlay.winId())), _NOTIFY_FOR_THIS_SESSION)
     except Exception as e:
-        print(f"[main] WTS session notification registration failed: {e}")
+        log(f"[main] WTS session notification registration failed: {e}")
 
     _register_all_hotkeys()
+    _heal_timer.start()   # periodic self-heal if a hotkey is later stolen/lost
 
     sys.exit(app.exec())
 
