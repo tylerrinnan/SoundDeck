@@ -48,7 +48,17 @@ jobs:
         run: python make_icon.py
 
       - name: Build executable (PyInstaller)
-        run: python -m PyInstaller SoundDeck.spec
+        # SoundDeck.spec is gitignored (*.spec), so it isn't in the checkout.
+        # Use the same explicit invocation as build.bat instead.
+        run: >
+          python -m PyInstaller --onedir --windowed --name SoundDeck
+          --icon=sounddeck.ico
+          --hidden-import=pycaw --hidden-import=pycaw.pycaw
+          --hidden-import=pycaw.api.mmdeviceapi --hidden-import=pycaw.constants
+          --hidden-import=comtypes --hidden-import=comtypes.client
+          --hidden-import=pystray._win32 --hidden-import=PIL
+          --collect-all=pycaw --collect-all=comtypes
+          main.py
 
       - name: Compute next version
         id: version
