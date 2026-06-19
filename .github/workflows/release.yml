@@ -93,8 +93,8 @@ jobs:
           # Auto-generated "What's Changed" changelog (same content --generate-notes produces).
           $changelog = gh api "repos/$env:REPO/releases/generate-notes" `
             -f tag_name="$env:VERSION" -f target_commitish="$env:SHA" --jq ".body"
-          # Prepend install instructions from the committed template (--generate-notes omits them).
+          # Append install instructions from the committed template (--generate-notes omits them).
           $install = (Get-Content ".github/release_body_template.md" -Raw).Replace("__VERSION__", $env:VERSION)
-          Set-Content -Path "release-notes.md" -Value ($install + $changelog) -Encoding utf8
+          Set-Content -Path "release-notes.md" -Value ($changelog + "`n`n" + $install) -Encoding utf8
           gh release create "$env:VERSION" "SoundDeck-$env:VERSION-win64.zip" `
             --title "SoundDeck $env:VERSION" --target "$env:SHA" --notes-file "release-notes.md"
