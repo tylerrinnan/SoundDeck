@@ -95,12 +95,14 @@ main.py          Entry point: hotkey wiring, single-instance mutex, resume hooks
 ```
 python main.py               # run from source (fastest dev loop)
 python -m pytest             # pure-logic tests (tests/, COM/Qt-free, fast)
+python -m pytest --cov       # coverage (scope/omit in pyproject; CI gates at >=85%)
 python -m pyright            # type-check gate (config in pyproject.toml, basic mode)
 build.bat                    # pip install + make_icon.py + PyInstaller --onedir
 rebuild.bat                  # taskkill SoundDeck.exe + rmdir dist + build.bat + launch
 dist\SoundDeck\SoundDeck.exe # built artifact (one folder, not one file)
 ```
-- Dev/test deps: `pip install -r requirements-dev.txt` (adds pytest; pyright via `pip install pyright`).
+- Dev/test deps: `pip install -r requirements-dev.txt` (adds pytest + pytest-cov; pyright via `pip install pyright`).
+- Coverage scope is `[tool.coverage.run]` in pyproject: the COM/Qt/hardware modules (audio, mixer, display, hdr, gsync, overlay, widgets, tray, main, make_icon, and the caps that wrap them) are omitted — they're verified by running, like pyright excludes them. CI enforces `--cov-fail-under=85` on the remaining logic.
 - pyright is clean at 0 errors; COM-object boundaries (comtypes/NVAPI) are typed `Any` on purpose, third-party stub gaps use scoped `# type: ignore[...]`.
 - `comtypes.client.gen_dir = None` set at import time — prevents comtypes writing .py wrappers in frozen exe.
 - `build.bat` passes hidden-imports for `pycaw.*`, `comtypes`, `pystray._win32`, `PIL` and `--collect-all=pycaw --collect-all=comtypes`. Add new dynamic imports to that list, not just `requirements.txt`.

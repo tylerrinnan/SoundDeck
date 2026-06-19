@@ -4,6 +4,46 @@ pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-q"
 
+[tool.coverage.run]
+# Measure the unit-testable logic. The COM / Qt / hardware layers are verified
+# by running the app (see CLAUDE.md), not by the pytest suite, so they are
+# omitted here the same way pyright excludes them — otherwise a 1000-line
+# overlay.py at 0% would swamp the signal from the logic that IS tested.
+source = ["."]
+branch = true
+omit = [
+    # COM / ctypes / NVAPI hardware layers (a bare name matches the file in any
+    # directory, so "hdr.py" also covers caps/hdr.py).
+    "audio.py",      # Core Audio COM
+    "mixer.py",      # per-app session COM
+    "display.py",    # ctypes user32 refresh-rate
+    "hdr.py",        # ctypes user32 HDR
+    "gsync.py",      # NVAPI ctypes
+    # Qt UI
+    "overlay.py",    # Qt overlay window
+    "widgets.py",    # Qt dialogs/widgets
+    "tray.py",       # pystray system tray
+    # app entry / build helper
+    "main.py",       # app wiring / Qt lifecycle
+    "make_icon.py",  # PIL build helper
+    # caps that only wrap the hardware layers above (apply/snapshot need a device)
+    "caps/audio_comms.py",
+    "caps/audio_output.py",
+    "caps/audio_volume.py",
+    "caps/gsync_global.py",
+    "caps/refresh_rate.py",
+    "tests/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+precision = 1
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
+
 [tool.pyright]
 # Type-check the source only; the app ships on Python 3.10+.
 include = ["."]
