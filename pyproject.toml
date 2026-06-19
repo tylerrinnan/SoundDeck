@@ -1,0 +1,18 @@
+[tool.pytest.ini_options]
+# Run pure-logic tests with the project root importable (no src/ layout).
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.pyright]
+# Type-check the source only; the app ships on Python 3.10+.
+include = ["."]
+# tests deliberately exercise Optional-returning APIs on the happy path
+# (asserts catch a None) — that idiom is validated by running, not typing.
+exclude = ["dist", "build", "files", "tests", "**/__pycache__", ".venv", "venv"]
+pythonVersion = "3.10"
+pythonPlatform = "Windows"
+typeCheckingMode = "basic"
+# pycaw / comtypes / pystray / keyboard ship no type stubs — silence the
+# "found module but no stubs" noise so the gate surfaces real issues only.
+reportMissingModuleSource = false

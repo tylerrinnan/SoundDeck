@@ -3,7 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project
-Windows system-tray audio switcher + display utility. PyQt6 overlay, pycaw/comtypes COM audio, NVAPI for G-Sync, PyInstaller frozen exe. No test framework — verify by running.
+Windows system-tray audio switcher + display utility. PyQt6 overlay, pycaw/comtypes COM audio, NVAPI for G-Sync, PyInstaller frozen exe. Pure-logic modules have a `pytest` suite (`tests/`); COM/Qt paths are still verified by running.
 
 ## Architecture
 
@@ -50,7 +50,7 @@ main.py          Entry point: hotkey, single-instance mutex, manager wiring
 - `AudioManager.get_playback_devices()` uses `EDataFlow.eRender`; `get_recording_devices()` uses `EDataFlow.eCapture`.
 - `get_default_comms_capture_id()` / `set_comms_capture_device()` handle the capture-side comms default.
 - Default device roles: E_CONSOLE=0, E_MULTIMEDIA=2, E_COMMS=1.
-- `set_output_device` sets both E_CONSOLE and E_MULTIMEDIA roles; `set_comms_device` sets E_COMMS only.
+- `set_output_device` sets both E_CONSOLE and E_MULTIMEDIA roles; `set_comms_capture_device` sets E_COMMS on the capture endpoint.
 
 ## COM audio (audio.py)
 - `CPolicyConfigClient` CLSID: `{870AF99C-171D-4F9E-AF0D-E63DF40C2BC9}`
@@ -58,7 +58,8 @@ main.py          Entry point: hotkey, single-instance mutex, manager wiring
 - `SetDefaultEndpoint` is vtable slot 13 regardless of which interface succeeds.
 - All `_ole32` calls use `c_long` return (not HRESULT) so failures are values, not raised OSError.
 - `get_volume` uses direct `IMMDeviceEnumerator.GetDevice(id)` → `Activate(IAudioEndpointVolume)` with cache. Falls back to full enumeration only on error.
-- Log: `~\AppData\Roaming\SoundDeck\sounddeck.log`
+- `_enumerator()` caches one `IMMDeviceEnumerator` per COM-pool thread (`threading.local`); `_drop_enumerator()` is called on any failure so a stale proxy self-heals on the next call. Never construct the enumerator directly elsewhere.
+- Logging is centralized in `log.py` (one `logging` sink, persistent file handle). Use `from log import log` for plain-string lines (`audio`, `gsync`) or `get_logger("name")` for a stdlib child logger (`hdr`). Never re-open the log file directly. Path: `~\AppData\Roaming\SoundDeck\sounddeck.log`
 
 ## Mixer (mixer.py)
 - Enumerates ALL active render endpoints (not just default) to catch apps outputting to non-default devices.
@@ -84,10 +85,14 @@ main.py          Entry point: hotkey, single-instance mutex, manager wiring
 ## Build & run
 ```
 python main.py               # run from source (fastest dev loop)
+python -m pytest             # pure-logic tests (tests/, COM/Qt-free, fast)
+python -m pyright            # type-check gate (config in pyproject.toml, basic mode)
 build.bat                    # pip install + make_icon.py + PyInstaller --onedir
 rebuild.bat                  # taskkill SoundDeck.exe + rmdir dist + build.bat + launch
 dist\SoundDeck\SoundDeck.exe # built artifact (one folder, not one file)
 ```
+- Dev/test deps: `pip install -r requirements-dev.txt` (adds pytest; pyright via `pip install pyright`).
+- pyright is clean at 0 errors; COM-object boundaries (comtypes/NVAPI) are typed `Any` on purpose, third-party stub gaps use scoped `# type: ignore[...]`.
 - `comtypes.client.gen_dir = None` set at import time — prevents comtypes writing .py wrappers in frozen exe.
 - `build.bat` passes hidden-imports for `pycaw.*`, `comtypes`, `pystray._win32`, `PIL` and `--collect-all=pycaw --collect-all=comtypes`. Add new dynamic imports to that list, not just `requirements.txt`.
 - Single-instance enforced via named mutex `SoundDeck_SingleInstance_Mutex` (`main._ensure_single_instance`).
@@ -108,5 +113,6 @@ pycaw, comtypes, PyQt6, pystray, Pillow, keyboard, psutil, pywin32
 - All COM calls MUST run in `_com_thread()` — never on the Qt UI thread.
 - When adding new settings, add to `SettingsManager._DEFAULTS` and update `SettingsDialog` in `widgets.py`.
 - When adding new themes, add to `THEMES` dict in `theme.py`.
-- Profile fields must be added to the `Profile` dataclass AND handled in `_load_profile` dict comprehension.
+- Profiles are `Mode` objects (`mode.py`): a `caps` dict keyed by `Capability.name`. The legacy flat `Profile(...)` factory and `migrate_flat_dict` keep old call sites/JSON working. Add a new capability = new `caps/*.py` module + one line in `build_default_registry`.
+- Profile capture: `_save_new_profile` snapshots the full current state via `Registry.snapshot()` (audio + refresh + HDR + G-Sync, off-thread); `_update_active_profile` edits only the audio caps via `Mode`'s setters so sibling caps are never dropped. Apply runs every cap in `_apply_profile`.
 - Fingerprint pattern: every rebuild method checks a `_last_*_key` tuple and short-circuits if unchanged.

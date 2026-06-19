@@ -5,11 +5,16 @@ mixer.py — Per-app audio session enumeration and volume control.
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from typing import List
 
+import comtypes
 import psutil
 from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
+from pycaw.api.audiopolicy import IAudioSessionControl2
+from pycaw.constants import EDataFlow
+from pycaw.utils import AudioSession as _PycawSession
 
 
 @dataclass
@@ -29,6 +34,11 @@ class MixerManager:
         # cached ISimpleAudioVolume pointer is only valid on the thread
         # that obtained it. Sharing across threads = RPC errors.
         self._iface_local = threading.local()
+        # pid -> (display_name, exe_path). name/exe never change during a
+        # process's life, so this avoids re-hitting psutil every 3 s refresh.
+        # Pruned to live PIDs each get_sessions(); safe across COM threads
+        # because writes are idempotent value assignments.
+        self._proc_cache: dict[int, tuple[str, str]] = {}
 
     def _cache(self) -> dict:
         cache = getattr(self._iface_local, "cache", None)
@@ -39,10 +49,6 @@ class MixerManager:
 
     def _enum_all_endpoints(self):
         """Yield (IAudioSessionControl2, _PycawSession) from all active render endpoints."""
-        from pycaw.api.audiopolicy import IAudioSessionControl2
-        from pycaw.utils import AudioSession as _PycawSession
-        from pycaw.constants import EDataFlow
-
         seen_instance_ids: set = set()
         devices = AudioUtilities.GetAllDevices(
             data_flow=EDataFlow.eRender.value,
@@ -74,7 +80,6 @@ class MixerManager:
         Enumerate active audio sessions from ALL render endpoints.
         Must be called from a thread with CoInitialize().
         """
-        import comtypes
         try:
             comtypes.CoInitialize()
         except Exception:
@@ -121,6 +126,11 @@ class MixerManager:
             result.append(AudioSession(pid=proc_id, name=display_name, volume=vol,
                                        muted=muted, exe_path=exe_path))
 
+        # Drop process-info cache entries for PIDs that no longer have a
+        # session — bounds the cache and limits stale data on PID reuse.
+        if len(self._proc_cache) > len(seen_pids):
+            self._proc_cache = {p: i for p, i in self._proc_cache.items() if p in seen_pids}
+
         # Disambiguate duplicate display names by appending PID
         for s in result:
             if name_counts[s.name] > 1:
@@ -133,10 +143,13 @@ class MixerManager:
         result.sort(key=lambda s: (s.pid != 0, s.name.lower()))
         return result
 
-    @staticmethod
-    def _process_info(pid: int) -> tuple[str, str]:
-        """Return (display_name, exe_path) for a PID. exe_path is "" if the
-        process is gone or its image path is inaccessible."""
+    def _process_info(self, pid: int) -> tuple[str, str]:
+        """Return (display_name, exe_path) for a PID, cached for the process's
+        life. exe_path is "" if the process is gone or its image path is
+        inaccessible. The cache is pruned to live PIDs by get_sessions()."""
+        cached = self._proc_cache.get(pid)
+        if cached is not None:
+            return cached
         try:
             p = psutil.Process(pid)
             name = p.name().removesuffix(".exe").replace("_", " ").title()
@@ -144,9 +157,11 @@ class MixerManager:
                 exe = p.exe()
             except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
                 exe = ""
-            return name, exe
+            info = (name, exe)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return f"PID {pid}", ""
+            info = (f"PID {pid}", "")
+        self._proc_cache[pid] = info
+        return info
 
     def _find_session_iface(self, pid: int):
         """Return ISimpleAudioVolume for the given PID.
@@ -155,8 +170,6 @@ class MixerManager:
         enumeration during rapid slider adjustments. Cache is per-thread —
         the pointer is only valid on the STA that produced it.
         """
-        import time
-        import comtypes
         try:
             comtypes.CoInitialize()
         except Exception:

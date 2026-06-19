@@ -19,22 +19,16 @@ VRR_MODE values:
 
 from __future__ import annotations
 import ctypes
-import os
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
+
+from log import log as _shared_log
 
 NVAPI_OK                = 0
 NVAPI_SETTING_NOT_FOUND = -114
 
 
 def _log(msg: str) -> None:
-    try:
-        p = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
-                         "SoundDeck", "sounddeck.log")
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "a", encoding="utf-8") as f:
-            f.write("[gsync] " + msg + "\n")
-    except Exception:
-        pass
+    _shared_log("[gsync] " + msg)
 
 
 # ── NVAPI function offsets (stable across driver versions) ──────────────────
@@ -100,9 +94,10 @@ class GSyncManager:
     """Global G-Sync Compatible (Adaptive Sync) toggle via NVAPI DRS."""
 
     def __init__(self) -> None:
-        self._dll = None
-        self._qi  = None
-        self._fns: Dict[int, object] = {}
+        self._dll: Any = None
+        self._qi:  Any = None
+        # fid -> resolved ctypes function pointer (built dynamically; typed Any).
+        self._fns: Dict[int, Any] = {}
         self._available = False
         self._id_cache: Dict[str, int] = {}
         self._capable_cache: Dict[str, bool] = {}
@@ -133,7 +128,7 @@ class GSyncManager:
         self._available = True
         _log("NVAPI initialized OK")
 
-    def _fn(self, fid: int, *argtypes):
+    def _fn(self, fid: int, *argtypes) -> Any:
         cached = self._fns.get(fid)
         if cached is not None:
             return cached
