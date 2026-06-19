@@ -1,0 +1,85 @@
+name: Release
+
+# Runs on every merge to main (i.e. after a PR lands). Re-runs the full CI gate
+# first, then builds the frozen exe and publishes a GitHub Release.
+# Escape hatch: put [skip release] in the merge commit message to build/test
+# only without cutting a release. Manual runs are allowed via the Actions tab.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Needed to create tags + releases with the default GITHUB_TOKEN.
+permissions:
+  contents: write
+
+# Never run two releases at once (avoids tag/version races).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Reuse the exact PR gate so we never release something that failed tests.
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: test
+    if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need full tag history to compute the next version
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install runtime + build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate icon
+        run: python make_icon.py
+
+      - name: Build executable (PyInstaller)
+        run: python -m PyInstaller SoundDeck.spec
+
+      - name: Compute next version
+        id: version
+        shell: pwsh
+        run: |
+          git fetch --tags --force
+          $tags = git tag -l "v*.*.*"
+          if ($tags) {
+            $latest = $tags | Sort-Object { [version]($_ -replace '^v','') } | Select-Object -Last 1
+            $v = [version]($latest -replace '^v','')
+            $next = "v{0}.{1}.{2}" -f $v.Major, $v.Minor, ($v.Build + 1)
+          } else {
+            $next = "v1.0.0"
+          }
+          Write-Host "Next version: $next"
+          "version=$next" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Package release archive
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: Compress-Archive -Path dist/SoundDeck -DestinationPath "SoundDeck-$env:VERSION-win64.zip"
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: >
+          gh release create "$env:VERSION"
+          "SoundDeck-$env:VERSION-win64.zip"
+          --title "SoundDeck $env:VERSION"
+          --target "${{ github.sha }}"
+          --generate-notes
