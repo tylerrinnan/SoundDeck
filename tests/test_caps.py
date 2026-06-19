@@ -67,3 +67,13 @@ def test_snapshot_skips_unavailable_none_and_raising():
     r.register(_Stub("no_state", current=None))
     r.register(_Stub("broken", raise_on_current=True))
     assert r.snapshot() == {"ok": {"x": 1}}
+
+
+def test_build_default_registry_registers_every_capability():
+    from caps import build_default_registry
+    # Caps only stash the manager at construction, so opaque dummies are fine here.
+    dummy = object()
+    r = build_default_registry(audio=dummy, display=dummy, hdr=dummy, gsync=dummy)
+    names = set(r.all())
+    assert "audio.output" in names
+    assert len(names) == 6        # one entry per registered capability, no clobbering

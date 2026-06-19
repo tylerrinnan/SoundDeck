@@ -78,6 +78,13 @@ def test_clearing_audio_field_removes_only_its_cap():
     assert m.caps["audio.output"] == {"device_id": "o"}
 
 
+def test_clearing_output_device_removes_its_cap():
+    m = make_audio_mode("R", output_device_id="o1", comms_device_id="c1")
+    m.output_device_id = ""             # falsy -> drop the output cap entirely
+    assert "audio.output" not in m.caps
+    assert m.caps["audio.comms"] == {"device_id": "c1"}
+
+
 def test_migrate_is_idempotent_on_caps_shape():
     already = {"name": "New", "caps": {"audio.output": {"device_id": "o"}},
                "hotkey": "x", "triggers": [{"kind": "k"}]}
