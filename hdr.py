@@ -5,7 +5,8 @@ Toggle via keyboard.send('windows+alt+b') — reliable cross-app key injection.
 
 import ctypes
 import ctypes.wintypes as wt
-import logging
+
+from log import get_logger
 
 QDC_ONLY_ACTIVE_PATHS                              = 0x00000002
 DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME          = 1
@@ -94,7 +95,7 @@ class DISPLAYCONFIG_ADVANCED_COLOR_INFO(ctypes.Structure):
     # sizeof = 32 bytes — must equal header.size
 
 
-_log = logging.getLogger(__name__)
+_log = get_logger("hdr")
 
 
 def _is_hdr_active(value):
@@ -208,11 +209,3 @@ class HDRManager:
             return ret == ERROR_SUCCESS
         _log.warning("set_hdr_state: device %r not found in active paths", dev_name)
         return False
-
-    def get_hdr_state(self) -> bool:
-        return any(self.get_hdr_states().values())
-
-    def toggle_hdr(self) -> None:
-        """Send Win+Alt+B using the keyboard library — works from any context."""
-        import keyboard
-        keyboard.send("windows+alt+b")

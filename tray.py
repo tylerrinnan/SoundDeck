@@ -58,17 +58,18 @@ class TrayManager:
         self._quit             = quit_fn
         self._exe_path         = exe_path
         self._change_hotkey_fn = change_hotkey_fn
-        self._icon: pystray.Icon | None = None
+        self._icon: "pystray.Icon | None" = None  # type: ignore[reportInvalidTypeForm]  # pystray: no stubs
         self._cached_tooltip: str = "SoundDeck"
 
     def start(self) -> None:
-        self._icon = pystray.Icon(
+        icon = pystray.Icon(
             name  = APP_NAME,
             icon  = _make_icon(),
             title = self._build_tooltip(),
             menu  = self._build_menu(),
         )
-        threading.Thread(target=self._icon.run, daemon=True).start()
+        self._icon = icon
+        threading.Thread(target=icon.run, daemon=True).start()
 
     def update_tooltip(self, device_name: str | None = None) -> None:
         """Update tray tooltip. Pass device_name to avoid a COM round-trip."""

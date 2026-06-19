@@ -1,0 +1,3 @@
+# Dev/test-only dependencies (not bundled in the frozen exe).
+-r requirements.txt
+pytest>=8.0

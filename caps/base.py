@@ -44,3 +44,19 @@ class Registry:
 
     def availability(self) -> Dict[str, bool]:
         return {n: c.available() for n, c in self._caps.items()}
+
+    def snapshot(self) -> Dict[str, dict]:
+        """Capture {name: current_state} for every available capability that has
+        a readable current state. Calls into COM / NVAPI — run on a worker
+        thread, never the Qt UI thread. A failing capability is skipped, not
+        fatal, so one bad driver can't sink the whole snapshot."""
+        out: Dict[str, dict] = {}
+        for name, cap in self._caps.items():
+            try:
+                if cap.available():
+                    state = cap.current()
+                    if state is not None:
+                        out[name] = state
+            except Exception:
+                continue
+        return out

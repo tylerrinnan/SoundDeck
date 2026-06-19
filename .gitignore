@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
 
 # PyInstaller build output
 build/
@@ -20,6 +21,8 @@ dist-backup/
 
 # Dev probe / scratch scripts
 _*.py
+# …but never ignore package __init__.py (the _*.py rule would otherwise eat it)
+!**/__init__.py
 
 # Logs
 *.log

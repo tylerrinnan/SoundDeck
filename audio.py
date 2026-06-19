@@ -3,11 +3,9 @@ audio.py — Windows Core Audio device management.
 """
 
 import ctypes
-import os
-import sys
 import threading
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
 # ── comtypes cache fix for PyInstaller frozen exes ────────────────────────────
 # comtypes tries to write generated wrapper .py files to disk at import time.
@@ -23,17 +21,7 @@ from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume, IAudioMeterInforma
 from pycaw.api.mmdeviceapi import IMMDeviceEnumerator
 from pycaw.constants import CLSID_MMDeviceEnumerator, EDataFlow, DEVICE_STATE
 
-# ── Log file (visible even from windowed exe) ─────────────────────────────────
-def _log(msg: str) -> None:
-    print(msg, flush=True)
-    try:
-        log_path = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
-                                "SoundDeck", "sounddeck.log")
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
-    except Exception:
-        pass
+from log import log as _log
 
 # ── Role constants ────────────────────────────────────────────────────────────
 E_CONSOLE    = 0
@@ -93,7 +81,7 @@ _ole32.CoCreateInstance.argtypes = [
     ctypes.POINTER(ctypes.c_void_p),   # ppv
 ]
 
-def _vtable(ptr: ctypes.c_void_p) -> ctypes.Array:
+def _vtable(ptr: ctypes.c_void_p) -> Any:
     """Return the vtable pointer array for a COM object pointer."""
     return ctypes.cast(
         ctypes.cast(ptr, ctypes.POINTER(ctypes.c_size_t))[0],
@@ -219,21 +207,44 @@ class AudioManager:
         self._peak_cache: dict = {}  # device_id -> IAudioMeterInformation
         self._peak_fallback: dict = {}  # device_id -> fallback device_id
         self._peak_fallback_probed: dict = {}  # device_id -> bool
+        # Per-thread IMMDeviceEnumerator. COM objects are apartment-bound, so
+        # each COM-pool worker keeps its own; recreated on demand if a call
+        # drops it (e.g. a dead proxy after suspend). Reusing it avoids a
+        # CoCreateInstance on every enumeration / default-device lookup.
+        self._enum_local = threading.local()
         # Serialize SetDefaultEndpoint across the COM pool — rapid clicks
         # otherwise interleave on three pool threads, producing non-deterministic
         # final default (visible in log as doubled vtable[13] lines).
         self._policy_lock = threading.Lock()
 
+    def _enumerator(self) -> Any:
+        """Return this thread's cached IMMDeviceEnumerator, creating it lazily.
+
+        Typed Any: comtypes builds the COM vtable methods (EnumAudioEndpoints,
+        GetDefaultAudioEndpoint, GetDevice) dynamically, so static stubs don't
+        see them."""
+        enum = getattr(self._enum_local, "enum", None)
+        if enum is None:
+            enum = comtypes.client.CreateObject(
+                CLSID_MMDeviceEnumerator, clsctx=CLSCTX_ALL, interface=IMMDeviceEnumerator
+            )
+            self._enum_local.enum = enum
+        return enum
+
+    def _drop_enumerator(self) -> None:
+        """Discard this thread's cached enumerator so the next call rebuilds it.
+        Called after any failure that may indicate a stale COM proxy."""
+        self._enum_local.enum = None
+
     def _active_render_devices(self):
         # Enumerate render-only IDs via direct COM call (reliable across pycaw versions),
         # then filter AudioUtilities results so capture devices never appear.
         try:
-            enum = comtypes.client.CreateObject(
-                CLSID_MMDeviceEnumerator, clsctx=CLSCTX_ALL, interface=IMMDeviceEnumerator
-            )
-            col = enum.EnumAudioEndpoints(EDataFlow.eRender.value, DEVICE_STATE.ACTIVE.value)
+            col = self._enumerator().EnumAudioEndpoints(
+                EDataFlow.eRender.value, DEVICE_STATE.ACTIVE.value)
             render_ids = {col.Item(i).GetId() for i in range(col.GetCount())}
         except Exception as e:
+            self._drop_enumerator()
             _log(f"[audio] _active_render_devices enumeration error: {e}")
             render_ids = None
 
@@ -244,13 +255,12 @@ class AudioManager:
 
     def _active_capture_devices(self):
         try:
-            enum = comtypes.client.CreateObject(
-                CLSID_MMDeviceEnumerator, clsctx=CLSCTX_ALL, interface=IMMDeviceEnumerator
-            )
-            col = enum.EnumAudioEndpoints(EDataFlow.eCapture.value, DEVICE_STATE.ACTIVE.value)
+            col = self._enumerator().EnumAudioEndpoints(
+                EDataFlow.eCapture.value, DEVICE_STATE.ACTIVE.value)
             count = col.GetCount()
             capture_ids = {col.Item(i).GetId() for i in range(count)}
         except Exception as e:
+            self._drop_enumerator()
             _log(f"[audio] _active_capture_devices enumeration error: {e}")
             return []
 
@@ -287,22 +297,14 @@ class AudioManager:
     def get_default_output_id(self) -> Optional[str]:
         return self._get_default_id(EDataFlow.eRender.value, E_CONSOLE)
 
-    def get_default_comms_id(self) -> Optional[str]:
-        return self._get_default_id(EDataFlow.eRender.value, E_COMMS)
-
     def get_default_comms_capture_id(self) -> Optional[str]:
         return self._get_default_id(EDataFlow.eCapture.value, E_COMMS)
 
     def _get_default_id(self, flow: int, role: int) -> Optional[str]:
         try:
-            enum = comtypes.client.CreateObject(
-                CLSID_MMDeviceEnumerator,
-                clsctx=CLSCTX_ALL,
-                interface=IMMDeviceEnumerator,
-            )
-            dev = enum.GetDefaultAudioEndpoint(flow, role)
-            return dev.GetId()
+            return self._enumerator().GetDefaultAudioEndpoint(flow, role).GetId()
         except Exception as e:
+            self._drop_enumerator()
             _log(f"[audio] get_default_id(flow={flow}, role={role}) error: {e}")
             return None
 
@@ -324,17 +326,6 @@ class AudioManager:
         actual = self.get_default_output_id()
         if actual and actual != device_id:
             _log(f"[audio] WARN set_output_device: accepted but actual default still {actual!r}")
-
-    def set_comms_device(self, device_id: str) -> None:
-        _log(f"[audio] set_comms_device: {device_id}")
-        with self._policy_lock:
-            try:
-                hr = _policy_set_default(device_id, E_COMMS)
-                _log(f"[audio] SetDefaultEndpoint(comms) hr={hr:#010x}")
-            except Exception as e:
-                _log(f"[audio] set_comms_device error: {e}")
-                import traceback
-                _log(traceback.format_exc())
 
     def set_comms_capture_device(self, device_id: str) -> None:
         _log(f"[audio] set_comms_capture_device: {device_id}")
@@ -369,16 +360,13 @@ class AudioManager:
         # Failures here are expected during the brief window an _active_*_id
         # has drifted past a removed device; logging would flood at 80 ms poll.
         try:
-            enum = comtypes.client.CreateObject(
-                CLSID_MMDeviceEnumerator, clsctx=CLSCTX_ALL, interface=IMMDeviceEnumerator
-            )
-            dev = enum.GetDevice(device_id)
+            dev = self._enumerator().GetDevice(device_id)
             ep = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
             vol_iface = ep.QueryInterface(IAudioEndpointVolume)
             self._ep_volume_cache[device_id] = vol_iface
             return vol_iface
         except Exception:
-            pass
+            self._drop_enumerator()
         # Fallback: enumerate all devices
         try:
             for dev in self._active_render_devices():
@@ -454,10 +442,8 @@ class AudioManager:
         if count % 25 != 0:
             return 0.0
         try:
-            enum = comtypes.client.CreateObject(
-                CLSID_MMDeviceEnumerator, clsctx=CLSCTX_ALL, interface=IMMDeviceEnumerator
-            )
-            col = enum.EnumAudioEndpoints(EDataFlow.eRender.value, DEVICE_STATE.ACTIVE.value)
+            col = self._enumerator().EnumAudioEndpoints(
+                EDataFlow.eRender.value, DEVICE_STATE.ACTIVE.value)
             for i in range(col.GetCount()):
                 dev = col.Item(i)
                 did = dev.GetId()
@@ -466,24 +452,22 @@ class AudioManager:
                 try:
                     ep = dev.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None)
                     meter = ep.QueryInterface(IAudioMeterInformation)
-                    if float(meter.GetPeakValue()) > 0.0:
+                    peak = float(meter.GetPeakValue())
+                    if peak > 0.0:
                         self._peak_cache[did] = meter
                         self._peak_fallback[device_id] = did
-                        return float(meter.GetPeakValue())
+                        return peak
                 except Exception:
                     continue
         except Exception:
-            pass
+            self._drop_enumerator()
         return 0.0
 
     def _get_peak_meter(self, device_id: str):
         if device_id in self._peak_cache:
             return self._peak_cache[device_id]
         try:
-            enum = comtypes.client.CreateObject(
-                CLSID_MMDeviceEnumerator, clsctx=CLSCTX_ALL, interface=IMMDeviceEnumerator
-            )
-            dev = enum.GetDevice(device_id)
+            dev = self._enumerator().GetDevice(device_id)
             ep = dev.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None)
             meter = ep.QueryInterface(IAudioMeterInformation)
             self._peak_cache[device_id] = meter
@@ -491,5 +475,5 @@ class AudioManager:
         except Exception:
             # Silent — polled at 80 ms; would flood the log when active_*_id
             # briefly references a removed/post-suspend device.
-            pass
+            self._drop_enumerator()
         return None

@@ -21,7 +21,7 @@ def make_icon(size: int = 64) -> Image.Image:
 if __name__ == "__main__":
     img = make_icon()
     sizes = [16, 32, 48, 64]
-    imgs  = [img.resize((s, s), Image.LANCZOS) for s in sizes]
+    imgs  = [img.resize((s, s), Image.Resampling.LANCZOS) for s in sizes]
     imgs[0].save("sounddeck.ico", format="ICO",
                  sizes=[(s, s) for s in sizes],
                  append_images=imgs[1:])

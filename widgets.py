@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 from PyQt6.QtCore import (
     QEasingCurve, QPoint, QPropertyAnimation,
-    Qt, pyqtProperty, pyqtSignal,
+    Qt, pyqtProperty, pyqtSignal,  # type: ignore[reportAttributeAccessIssue]  # pyqtProperty: PyQt6 stub gap
 )
 from PyQt6.QtGui import QBrush, QColor, QPainter, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
@@ -48,7 +48,7 @@ class ToggleSwitch(QWidget):
         self.update()
 
     @pyqtProperty(float)
-    def knob_pos(self) -> float:
+    def knob_pos(self) -> float:  # type: ignore[reportRedeclaration]  # Qt property getter/setter pair
         return self._knob_x_val
 
     @knob_pos.setter  # type: ignore[no-redef]
@@ -379,7 +379,7 @@ class SettingsDialog(QDialog):
         # Select current theme
         for i in range(model.rowCount()):
             it = model.item(i)
-            if it.data(Qt.ItemDataRole.UserRole) == current:
+            if it is not None and it.data(Qt.ItemDataRole.UserRole) == current:
                 combo.setCurrentIndex(i)
                 break
         return combo

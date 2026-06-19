@@ -22,17 +22,38 @@ class Mode:
     triggers: List[Dict]  = field(default_factory=list)
 
     # ── Back-compat flat-field views ──────────────────────────────────────
+    # Setters write/clear only their own cap key, so updating one audio field
+    # never drops sibling caps (display.hdr / gsync.global / display.refresh) —
+    # this is what lets overlay merge instead of rebuilding a flat profile.
     @property
     def output_device_id(self) -> str:
         return self.caps.get("audio.output", {}).get("device_id", "")
+
+    @output_device_id.setter
+    def output_device_id(self, did: str) -> None:
+        if did:
+            self.caps["audio.output"] = {"device_id": did}
+        else:
+            self.caps.pop("audio.output", None)
 
     @property
     def comms_device_id(self) -> str:
         return self.caps.get("audio.comms", {}).get("device_id", "")
 
+    @comms_device_id.setter
+    def comms_device_id(self, did: str) -> None:
+        if did:
+            self.caps["audio.comms"] = {"device_id": did}
+        else:
+            self.caps.pop("audio.comms", None)
+
     @property
     def output_volume(self) -> float:
         return float(self.caps.get("audio.volume", {}).get("level", 1.0))
+
+    @output_volume.setter
+    def output_volume(self, level: float) -> None:
+        self.caps["audio.volume"] = {"device_id": self.output_device_id, "level": float(level)}
 
     @property
     def refresh_rate(self) -> int:

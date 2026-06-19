@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 from PyQt6.QtCore import (
@@ -27,6 +28,7 @@ from theme import (
     hdr_pill_style, gsync_pill_style,
 )
 from widgets import HotkeyDialog, SettingsDialog
+from profiles import Profile
 
 if TYPE_CHECKING:
     from audio import AudioManager, AudioDevice
@@ -41,6 +43,23 @@ if TYPE_CHECKING:
 
 _com_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="com")
 _com_initialized = threading.local()
+
+
+@dataclass
+class RefreshSnapshot:
+    """Everything _bg_refresh gathers off-thread, marshaled to the UI thread as
+    one object — replaces a 10-positional-arg signal that was easy to misorder."""
+    devices:         List["AudioDevice"]
+    capture_devices: List["AudioDevice"]
+    output_id:       Optional[str]
+    comms_id:        Optional[str]
+    volume:          float
+    mic_volume:      float
+    hdr_states:      dict
+    display_info:    dict
+    gsync_capable:   set
+    gsync_global:    Optional[bool]
+    user_switch_seq: int
 
 
 def _com_thread(fn: Callable) -> None:
@@ -80,9 +99,9 @@ class ClickOutsideFilter(QObject):
             # or popup (QMenu) is up. Those windows can extend past the
             # overlay's geometry, so clicks inside them would otherwise look
             # "outside" and close the overlay underneath.
-            app = QApplication.instance()
-            if app is not None and (app.activeModalWidget() is not None
-                                    or app.activePopupWidget() is not None):
+            # activeModalWidget/activePopupWidget are static on QApplication.
+            if (QApplication.activeModalWidget() is not None
+                    or QApplication.activePopupWidget() is not None):
                 return False
             pos = event.globalPosition().toPoint()  # type: ignore[attr-defined]
             if self._overlay.isVisible() and not self._overlay.geometry().contains(pos):
@@ -95,13 +114,17 @@ class ClickOutsideFilter(QObject):
 # ═══════════════════════════════════════════════════════════════════════════════
 class OverlayWindow(QWidget):
 
-    _refresh_ready = pyqtSignal(list, list, object, object, float, float, object, object, object, int)
+    # Peak meters poll at 80 ms; volume syncs every Nth tick (~240 ms).
+    _VOL_SYNC_EVERY = 3
+
+    _refresh_ready = pyqtSignal(object)  # RefreshSnapshot
     _vol_ready     = pyqtSignal(int)
     _mic_vol_ready = pyqtSignal(int)
     _peak_ready    = pyqtSignal(float, float)
     _mixer_ready   = pyqtSignal(list)
     _mute_ready    = pyqtSignal(bool, bool)
     _gsync_finish_ready = pyqtSignal(object)  # final state: bool | None
+    _caps_capture_ready = pyqtSignal(str, object)  # (profile_name, display caps dict)
 
     def __init__(
         self,
@@ -196,13 +219,16 @@ class OverlayWindow(QWidget):
         self._mixer_ready.connect(self._apply_mixer_refresh)
         self._gsync_finish_ready.connect(self._on_gsync_finish)
         self._mute_ready.connect(self._apply_mute_state)
+        self._caps_capture_ready.connect(self._on_caps_captured)
 
         # 3-second mixer auto-refresh (runs only while overlay is visible)
         self._mixer_timer = QTimer(self)
         self._mixer_timer.setInterval(3000)
         self._mixer_timer.timeout.connect(self._schedule_mixer_refresh)
 
-        # Volume sync: poll system volume every 80 ms while visible
+        # Peak meters animate at 80 ms; output/mic volume — which rarely changes
+        # and costs a COM round-trip each read — syncs every _VOL_SYNC_EVERY ticks.
+        self._poll_tick = 0
         self._vol_poll_timer = QTimer(self)
         self._vol_poll_timer.setInterval(80)
         self._vol_poll_timer.timeout.connect(self._poll_volume)
@@ -690,9 +716,10 @@ class OverlayWindow(QWidget):
                 pass
         elif pid == 0:
             try:
+                style = self.style()
                 sp = QStyle.StandardPixmap.SP_MediaVolume
-                icon = self.style().standardIcon(sp)
-                if not icon.isNull():
+                icon = style.standardIcon(sp) if style else None
+                if icon is not None and not icon.isNull():
                     px = icon.pixmap(size, size)
             except Exception:
                 pass
@@ -771,24 +798,6 @@ class OverlayWindow(QWidget):
     # ══════════════════════════════════════════════════════════════════════════
     #  Refresh
     # ══════════════════════════════════════════════════════════════════════════
-    def refresh(self) -> None:
-        """Synchronous refresh — still available for external callers."""
-        self._devices          = self._audio.get_playback_devices()
-        self._capture_devices  = self._audio.get_recording_devices()
-        self._active_output_id = self._audio.get_default_output_id()
-        self._active_comms_id  = self._audio.get_default_comms_capture_id()
-        self._last_device_key  = ()
-        self._last_profile_key = ()
-        self._rebuild_device_lists()
-        self._refresh_volume()
-        try:
-            self._hdr_states = self._hdr.get_hdr_states()
-        except Exception:
-            pass
-        self._last_display_key = ()
-        self._rebuild_display_section()
-        self._rebuild_profiles()
-
     def _rebuild_device_lists(self) -> None:
         new_key = (
             tuple(d.id for d in self._devices), self._active_output_id,
@@ -826,11 +835,6 @@ class OverlayWindow(QWidget):
             btn.clicked.connect(lambda _=False, d=dev: self._select_comms(d))
         return btn
 
-    def _refresh_volume(self) -> None:
-        if self._active_output_id:
-            vol = self._audio.get_volume(self._active_output_id)
-            self._set_volume_display(int(vol * 100))
-
     def _vol_skip_update(self) -> bool:
         return (self._vol_slider.isSliderDown()
                 or self._vol_debounce.isActive()
@@ -842,7 +846,10 @@ class OverlayWindow(QWidget):
                 or time.monotonic() < self._mic_freeze_until)
 
     def _poll_volume(self) -> None:
-        """Poll system volume, mic volume, and peak levels while visible."""
+        """Poll peak levels every tick (meter animation); sync output/mic
+        volume only every _VOL_SYNC_EVERY ticks to cut COM round-trips."""
+        self._poll_tick += 1
+        sync_vol = self._poll_tick % self._VOL_SYNC_EVERY == 0
         skip_vol = self._vol_skip_update()
         skip_mic = self._mic_skip_update()
         out_id = self._active_output_id
@@ -851,9 +858,9 @@ class OverlayWindow(QWidget):
             return
         def _do() -> None:
             try:
-                if not skip_vol and out_id:
+                if sync_vol and not skip_vol and out_id:
                     self._vol_ready.emit(int(self._audio.get_volume(out_id) * 100))
-                if not skip_mic and mic_id:
+                if sync_vol and not skip_mic and mic_id:
                     self._mic_vol_ready.emit(int(self._audio.get_volume(mic_id) * 100))
                 out_peak = self._audio.get_output_peak(out_id) if out_id else 0.0
                 mic_peak = self._audio.get_peak_level(mic_id) if mic_id else 0.0
@@ -889,12 +896,19 @@ class OverlayWindow(QWidget):
         self._output_peak.setValue(int(out_peak * 1000))
         self._mic_peak.setValue(int(mic_peak * 1000))
 
+    @staticmethod
+    def _restyle(w: QWidget) -> None:
+        """Re-evaluate QSS after a dynamic property change. style() may be None."""
+        style = w.style()
+        if style is not None:
+            style.unpolish(w)
+            style.polish(w)
+
     def _set_mute_display(self, is_mic: bool, muted: bool) -> None:
         btn = self._mic_mute_btn if is_mic else self._mute_btn
         btn.setText("\U0001f507" if muted else "\U0001f50a")  # 🔇 or 🔊
         btn.setProperty("muted", "true" if muted else "false")
-        btn.style().unpolish(btn)
-        btn.style().polish(btn)
+        self._restyle(btn)
 
     def _toggle_output_mute(self) -> None:
         if not self._active_output_id:
@@ -930,8 +944,9 @@ class OverlayWindow(QWidget):
 
         while self._profiles_row.count() > 2:
             item = self._profiles_row.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            w = item.widget() if item is not None else None
+            if w is not None:
+                w.deleteLater()
 
         for i, profile in enumerate(profiles):
             pill = QPushButton(profile.name)
@@ -946,8 +961,7 @@ class OverlayWindow(QWidget):
             pill.customContextMenuRequested.connect(
                 lambda pos, n=profile.name, w=pill: self._profile_context_menu(pos, n, w))
             self._profiles_row.insertWidget(i, pill)
-            pill.style().unpolish(pill)
-            pill.style().polish(pill)
+            self._restyle(pill)
 
     @staticmethod
     def _clear_layout(layout) -> None:
@@ -1015,15 +1029,16 @@ class OverlayWindow(QWidget):
     def _update_active_profile(self) -> None:
         if not self._active_profile_name:
             return
-        from profiles import Profile
         existing = self._profiles.get(self._active_profile_name)
-        self._profiles.add_or_update(Profile(
-            name             = self._active_profile_name,
-            output_device_id = self._active_output_id or "",
-            comms_device_id  = self._active_comms_id  or "",
-            output_volume    = self._vol_slider.value() / 100.0,
-            refresh_rate     = existing.refresh_rate if existing else 0,
-        ))
+        if existing is None:
+            return
+        # Update only the audio caps in place; the Mode setters leave any
+        # display.refresh / display.hdr / gsync.global caps the profile holds
+        # untouched (the old flat-rebuild silently dropped them).
+        existing.output_device_id = self._active_output_id or ""
+        existing.comms_device_id  = self._active_comms_id  or ""
+        existing.output_volume    = self._vol_slider.value() / 100.0
+        self._profiles.add_or_update(existing)
 
     def _on_gsync_global_toggled(self) -> None:
         if self._gsync_busy:
@@ -1062,7 +1077,7 @@ class OverlayWindow(QWidget):
 
         def _do() -> None:
             ok = self._hdr.set_hdr_state(dev_name, enable)
-            import time; time.sleep(0.4)
+            time.sleep(0.4)
             try:
                 states = self._hdr.get_hdr_states()
             except Exception:
@@ -1131,17 +1146,38 @@ class OverlayWindow(QWidget):
             self, "Save Profile", "Profile name:", QLineEdit.EchoMode.Normal, "")
         if not ok or not name.strip():
             return
-        from profiles import Profile
+        name = name.strip()
+        # Persist the audio selection immediately so the pill appears at once …
         self._profiles.add_or_update(Profile(
-            name             = name.strip(),
+            name             = name,
             output_device_id = self._active_output_id or "",
             comms_device_id  = self._active_comms_id  or "",
             output_volume    = self._vol_slider.value() / 100.0,
         ))
-        self._active_profile_name = name.strip()
-        self._profiles.set_active(name.strip())
+        self._active_profile_name = name
+        self._profiles.set_active(name)
         self._last_profile_key    = ()
         self._rebuild_profiles()
+        # … then enrich it with a snapshot of the current display state
+        # (refresh / HDR / G-Sync) captured off the UI thread.
+        registry = self._caps_registry
+        def _do() -> None:
+            display = {k: v for k, v in registry.snapshot().items()
+                       if not k.startswith("audio.")}
+            if display:
+                self._caps_capture_ready.emit(name, display)
+        _com_thread(_do)
+
+    def _on_caps_captured(self, name: str, caps: object) -> None:
+        """Merge an off-thread display snapshot into a just-saved profile.
+        Runs on the UI thread — ProfileManager is not thread-safe."""
+        if not isinstance(caps, dict):
+            return
+        prof = self._profiles.get(name)
+        if prof is None:
+            return  # profile renamed/deleted before the snapshot returned
+        prof.caps = {**prof.caps, **caps}
+        self._profiles.add_or_update(prof)
 
     def _profile_context_menu(self, pos: QPoint, name: str, widget: QPushButton) -> None:
         menu = QMenu(self)
@@ -1256,11 +1292,14 @@ class OverlayWindow(QWidget):
                         gsync_global = self._gsync.is_global_enabled()
                     except Exception:
                         gsync_global = None
-            self._refresh_ready.emit(
-                devices, capture_devices, output_id, comms_id,
-                vol, mic_vol, hdr_state, display_info,
-                {"capable": gsync_capable, "global": gsync_global}, seq,
-            )
+            self._refresh_ready.emit(RefreshSnapshot(
+                devices=devices, capture_devices=capture_devices,
+                output_id=output_id, comms_id=comms_id,
+                volume=vol, mic_volume=mic_vol,
+                hdr_states=hdr_state, display_info=display_info,
+                gsync_capable=gsync_capable, gsync_global=gsync_global,
+                user_switch_seq=seq,
+            ))
             try:
                 sessions = self._mixer.get_sessions()
             except Exception:
@@ -1270,41 +1309,28 @@ class OverlayWindow(QWidget):
         finally:
             self._refresh_lock.release()
 
-    def _apply_bg_refresh(
-        self,
-        devices: List["AudioDevice"],
-        capture_devices: List["AudioDevice"],
-        output_id: Optional[str],
-        comms_id: Optional[str],
-        vol: float,
-        mic_vol: float,
-        hdr_state: object,
-        display_info: object,
-        gsync_state: object,
-        seq: int = 0,
-    ) -> None:
+    def _apply_bg_refresh(self, snap: RefreshSnapshot) -> None:
         """Apply fetched data on the UI thread."""
-        self._devices          = devices
-        self._capture_devices  = capture_devices
+        self._devices          = snap.devices
+        self._capture_devices  = snap.capture_devices
         # Only overwrite active device IDs if the user hasn't switched since
         # this refresh started — prevents stale OS reads from reverting clicks.
-        if seq == self._user_switch_seq:
-            self._active_output_id = output_id
-            self._active_comms_id  = comms_id
-        self._display_info  = display_info  # type: ignore[assignment]
-        self._hdr_states    = hdr_state     # type: ignore[assignment]
-        if isinstance(gsync_state, dict):
-            self._gsync_capable = set(gsync_state.get("capable", set()) or set())
-            if not self._gsync_busy:
-                self._gsync_global = gsync_state.get("global")
+        if snap.user_switch_seq == self._user_switch_seq:
+            self._active_output_id = snap.output_id
+            self._active_comms_id  = snap.comms_id
+        self._display_info  = snap.display_info
+        self._hdr_states    = snap.hdr_states
+        self._gsync_capable = set(snap.gsync_capable or set())
+        if not self._gsync_busy:
+            self._gsync_global = snap.gsync_global
 
         self._rebuild_device_lists()
         self._rebuild_profiles()
         self._rebuild_display_section()
         if not self._vol_skip_update():
-            self._set_volume_display(int(vol * 100))
+            self._set_volume_display(int(snap.volume * 100))
         if not self._mic_skip_update():
-            self._set_mic_volume_display(int(mic_vol * 100))
+            self._set_mic_volume_display(int(snap.mic_volume * 100))
 
     def invalidate_state(self) -> None:
         """Called by main.py on system resume / session unlock.
